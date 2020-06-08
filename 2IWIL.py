@@ -80,34 +80,58 @@ parser.add_argument('--ofolder', type=str, default='log')
 parser.add_argument('--ifolder', type=str, default='demonstrations')
 args = parser.parse_args()
 
+# Env maker
 env = gym.make(args.env)
 
+# obs.shape & acs.shape
 num_inputs = env.observation_space.shape[0]
 num_actions = env.action_space.shape[0]
 
+# seed for numpy, env and torch
 env.seed(args.seed)
 torch.manual_seed(args.seed)
 np.random.seed(args.seed)
 
+# Policy input -> action
 policy_net = Policy(num_inputs, num_actions, args.hidden_dim)
+# Value input -> 1
 value_net = Value(num_inputs, args.hidden_dim).to(device)
+
+# Discriminator num_inputs + num_actions -> 1
 discriminator = Discriminator(num_inputs + num_actions, args.hidden_dim).to(device)
+
+# Loss
 disc_criterion = nn.BCEWithLogitsLoss()
 value_criterion = nn.MSELoss()
+
+# Optimizer for discriminator and value_net
 disc_optimizer = optim.Adam(discriminator.parameters(), args.lr)
 value_optimizer = optim.Adam(value_net.parameters(), args.vf_lr)
 
+# Select action by policy_net
 def select_action(state):
+    # state transform to tensor
     state = torch.from_numpy(state).unsqueeze(0)
+    # Output of policy_net
     action_mean, _, action_std = policy_net(Variable(state))
+    # Sample from Gaussian distribution
     action = torch.normal(action_mean, action_std)
+    # return action
     return action
 
+# Update Trpo
 def update_params(batch):
+    # reward, masks, actions, states, values
+    # 奖赏：判别器奖赏
     rewards = torch.Tensor(batch.reward).to(device)
+    # 是否done，done为0，未done为1
     masks = torch.Tensor(batch.mask).to(device)
+    # 动作
     actions = torch.Tensor(np.concatenate(batch.action, 0)).to(device)
+    # 状态
     states = torch.Tensor(batch.state).to(device)
+
+    # V值，通过value_net网络计算 state -> 1
     values = value_net(Variable(states))
 
     returns = torch.Tensor(actions.size(0),1).to(device)
@@ -163,13 +187,14 @@ def update_params(batch):
 
     trpo_step(policy_net, get_loss, get_kl, args.max_kl, args.damping)
 
+# return Discriminator reward [state, action] -> 1
 def expert_reward(states, actions):
     states = np.concatenate(states)
     actions = np.concatenate(actions)
     state_action = torch.Tensor(np.concatenate([states, actions], 1)).to(device)
     return -F.logsigmoid(discriminator(state_action)).cpu().detach().numpy()
 
-
+# Evaluate
 def evaluate(episode):
     avg_reward = 0.0
     for _ in range(args.eval_epochs):
@@ -185,6 +210,7 @@ def evaluate(episode):
             state = next_state
     writer.log(episode, avg_reward / args.eval_epochs)
 
+# load dataset (condident score & unlabled)
 plabel = ''
 try:
     expert_traj = np.load("./{}/{}_mixture.npy".format(args.ifolder, args.env))
@@ -195,28 +221,40 @@ except:
     print('Mixture demonstrations not loaded successfully.')
     assert False
 
+# choice expert
 idx = np.random.choice(expert_traj.shape[0], args.traj_size, replace=False)
 expert_traj = expert_traj[idx, :]
 expert_conf = expert_conf[idx, :]
 
 
 ##### semi-confidence learning #####
+# prior：当前拥有confident score的数据占比
 num_label = int(args.prior * expert_conf.shape[0])
-
+# 随机排序
 p_idx = np.random.permutation(expert_traj.shape[0])
 expert_traj = expert_traj[p_idx, :]
 expert_conf = expert_conf[p_idx, :]
 
+# 分类器 得到unlabel数据的label
 if not args.only and args.weight:
-
+    # ----------------------- 数据准备 ------------------------------
+    # 有标签的前num_label个，用args.prior控制
     labeled_traj = torch.Tensor(expert_traj[:num_label, :]).to(device)
+    # 无标签的后num_label个
     unlabeled_traj = torch.Tensor(expert_traj[num_label:, :]).to(device)
+    # 标签为前num_label
     label = torch.Tensor(expert_conf[:num_label, :]).to(device)
 
+    # ----------------------- 分类器 ------------------------------
+    # 分类器 input -> 1
     classifier = Classifier(expert_traj.shape[1], 40).to(device)
+    # Opyimizer
     optim = optim.Adam(classifier.parameters(), 3e-4, amsgrad=True)
-    cu_loss = CULoss(expert_conf, beta=1-args.prior, non=True) 
+    # CULoss
+    cu_loss = CULoss(expert_conf, beta=1-args.prior, non=True)
 
+    # ----------------------- 训练 ------------------------------
+    # 最大的batch 128
     batch = min(128, labeled_traj.shape[0])
     ubatch = int(batch / labeled_traj.shape[0] * unlabeled_traj.shape[0])
     iters = 25000
@@ -236,27 +274,34 @@ if not args.only and args.weight:
        
         if i % 1000 == 0:
             print('iteration: {}\tcu loss: {:.3f}'.format(i, risk.data.item()))
-
+    # ----------------------- 所有数据 -> label ------------------------------
     classifier = classifier.eval()
     expert_conf = torch.sigmoid(classifier(torch.Tensor(expert_traj).to(device))).detach().cpu().numpy()
     expert_conf[:num_label, :] = label.cpu().detach().numpy()
 elif args.only and args.weight:
+    # 只用有标记的数据[:num_label]
     expert_traj = expert_traj[:num_label, :]
     expert_conf = expert_conf[:num_label, :]
     if args.noconf:
         expert_conf = np.ones(expert_conf.shape)
+
 ###################################
 Z = expert_conf.mean()
+# 无 Classification
 if args.only:
     fname = 'olabel'
 else:
+    # with classification
     fname = ''
+# 无标签的只用数据
 if args.noconf:
     fname = 'nc'
 
+# log文件夹名称
 writer = Writer(args.env, args.seed, args.weight, 'mixture', args.prior, args.traj_size, folder=args.ofolder, fname=fname, noise=args.noise)
 
 for i_episode in range(args.num_epochs):
+    # 经验池
     memory = Memory()
 
     num_steps = 0
@@ -269,56 +314,72 @@ for i_episode in range(args.num_epochs):
     mem_mask = []
     mem_next = []
 
+    # 采样 batch_size:5000
     while num_steps < args.batch_size:
         state = env.reset()
-   
 
         reward_sum = 0
         for t in range(10000): # Don't infinite loop while learning
+            # Policy_net state->action
             action = select_action(state)
             action = action.data[0].numpy()
+            # 数据 state & action append
             states.append(np.array([state]))
             actions.append(np.array([action]))
+
             next_state, true_reward, done, _ = env.step(action)
+            # 累积奖赏
             reward_sum += true_reward
 
+            # mask表示当前是否结束，结束的标志，未结束1，结束0
             mask = 1
             if done:
                 mask = 0
 
             mem_mask.append(mask)
+            # 记录下一状态
             mem_next.append(next_state)
 
             if done:
                 break
 
             state = next_state
+
         num_steps += (t-1)
         num_episodes += 1
 
         reward_batch.append(reward_sum)
 
+    # 单纯地评估当前策略
     evaluate(i_episode)
 
+    # 判别器的奖赏
     rewards = expert_reward(states, actions)
+    # 采样数据 + 判别器奖赏
     for idx in range(len(states)):
         memory.push(states[idx][0], actions[idx], mem_mask[idx], mem_next[idx], \
                     rewards[idx][0])
+    # 经验池采样
     batch = memory.sample()
+
+    # 更新policy_net和value_net参数
     update_params(batch)
 
     ### update discriminator ###
+    # ----------------------- 数据准备 ------------------------------
+    # agent date
     actions = torch.from_numpy(np.concatenate(actions))
     states = torch.from_numpy(np.concatenate(states))
-    
+    state_action = torch.cat((states, actions), 1).to(device)
+
+    # expert data
     idx = np.random.randint(0, expert_traj.shape[0], num_steps)
-    
     expert_state_action = expert_traj[idx, :]
     expert_pvalue = expert_conf[idx, :]
     expert_state_action = torch.Tensor(expert_state_action).to(device)
     expert_pvalue = torch.Tensor(expert_pvalue / Z).to(device)
 
-    state_action = torch.cat((states, actions), 1).to(device)
+    # ----------------------- 判别器 ------------------------------
     fake = discriminator(state_action)
     real = discriminator(expert_state_action)
 
